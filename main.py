@@ -20,7 +20,7 @@ os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
 COLLECTION_NAME = os.getenv("CHROMA_COLLECTION", "resumes")
 
 # Default folder for storing PDFs on disk
-DEFAULT_CV_DIR = os.path.join(Path(__file__).resolve(), 'cvs',)
+DEFAULT_CV_DIR = os.path.join(Path(__file__).resolve().parent, 'cvs',)
 
 app = FastAPI(title="Chatbot + Resume Scorer API (Chroma, PDF via PyPDFLoader)", version="1.0.0")
 
