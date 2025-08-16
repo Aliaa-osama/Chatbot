@@ -8,7 +8,7 @@ st.set_page_config(page_title="CV RAG Chat", page_icon="🧠", layout="centered"
 st.title("CV RAG Chat — Aliaa Osama Alkady")
 
 # Where your FastAPI is running
-API_BASE = st.sidebar.text_input("API base", "http://127.0.0.1:8000").rstrip("/")
+API_BASE = "https://chatbot-43d0.onrender.com/"
 
 # ---------- Sidebar ----------
 k = st.sidebar.slider("Top Candidates (k)", 1, 10, 2)
