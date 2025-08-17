@@ -4,7 +4,7 @@ import uuid
 import json
 
 # ---------- Config ----------
-st.set_page_config(page_title="CV RAG Chat", page_icon="🧠", layout="centered")
+st.set_page_config(page_title="CV RAG Chat", layout="centered")
 st.title("CV RAG Chat — Aliaa Osama Alkady")
 
 # Where your FastAPI is running
