@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import uuid
 import json
+import re  # NEW
 
 # ---------- Config ----------
 st.set_page_config(page_title="CV RAG Chat", layout="centered")
@@ -107,23 +108,118 @@ if prompt:
 
             # Handle new format: list of dicts {cv_snippet, score}
             elif isinstance(data, list) and data and isinstance(data[0], dict):
-                # Build a human-friendly transcript message to store in history
-                combined_lines = []
-                for i, item in enumerate(data, start=1):
-                    score_txt = item.get("score", "").strip()
-                    snippet = item.get("cv_snippet", "").strip()
-                    combined_lines.append(f"**Candidate {i}**\n\n{score_txt}\n\n```\n{snippet}\n```")
+                # ---- DEDUPE INLINE: group by name, keep highest score, then limit to k ----
+                buckets = {}  # name -> {"item": best_item, "score_val": float|None, "all": [items]}
+                for item in data:
+                    score_txt = (item.get("score") or "").strip()
+                    snippet_txt = (item.get("cv_snippet") or "")
 
-                    # Visual card per candidate
+                    # derive display name (try JSON->name/file/filename, else "CV: ..." line)
+                    name = None
+                    try:
+                        obj = json.loads(score_txt)
+                        if isinstance(obj, dict):
+                            name = obj.get("name") or obj.get("file") or obj.get("filename")
+                    except Exception:
+                        pass
+                    if not name:
+                        for line in snippet_txt.splitlines():
+                            if line.strip().lower().startswith("cv:"):
+                                name = line.split(":", 1)[-1].strip()
+                                break
+                    if name:
+                        name = name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+                        name = re.sub(r"\.(pdf|docx?)$", "", name, flags=re.I).replace("_", " ").strip()
+                    if not name:
+                        name = "Unknown Candidate"
+
+                    # numeric score (JSON 'score' or "Score: 78[/100]")
+                    score_val = None
+                    try:
+                        obj = json.loads(score_txt)
+                        if isinstance(obj, dict) and "score" in obj:
+                            score_val = float(obj["score"])
+                    except Exception:
+                        pass
+                    if score_val is None:
+                        m = re.search(r"Score\s*:\s*(\d+(?:\.\d+)?)(?:\s*/\s*100)?", score_txt, flags=re.I)
+                        if m:
+                            try:
+                                score_val = float(m.group(1))
+                            except Exception:
+                                pass
+
+                    entry = buckets.get(name)
+                    if not entry:
+                        buckets[name] = {"item": item, "score_val": score_val, "all": [item]}
+                    else:
+                        entry["all"].append(item)
+                        cur = entry["score_val"]
+                        if (score_val is not None) and (cur is None or score_val > cur):
+                            entry["item"], entry["score_val"] = item, score_val
+
+                # sort by score desc (None last), then name; apply k AFTER dedupe
+                unique = sorted(
+                    buckets.items(),
+                    key=lambda kv: (-(kv[1]["score_val"] if kv[1]["score_val"] is not None else float("-inf")), kv[0].lower()),
+                )[: int(k)]
+
+                # Render + build transcript
+                combined_lines = []
+                for idx, (name, pack) in enumerate(unique, start=1):
+                    best_item = pack["item"]
+                    score_txt = (best_item.get("score") or "").strip()
+                    snippet = (best_item.get("cv_snippet") or "").strip()
+
                     with st.container(border=True):
-                        st.markdown(f"### Candidate {i}")
-                        if score_txt:
-                            st.markdown(f"**{score_txt.splitlines()[0]}**")  # "Score: x/100"
-                            if len(score_txt.splitlines()) > 1:
-                                st.markdown(score_txt.splitlines()[1])      # "Reason: ..."
+                        st.markdown(f"### {name if name != 'Unknown Candidate' else f'Candidate {idx}'}")
+
+                        # Friendly score summary if possible
+                        shown_score = None
+                        try:
+                            obj = json.loads(score_txt)
+                            if isinstance(obj, dict):
+                                lines = []
+                                if "score" in obj:
+                                    lines.append(f"**Score:** {obj['score']}/100")
+                                if "explanation" in obj and obj["explanation"]:
+                                    lines.append(f"**Reason:** {obj['explanation']}")
+                                shown_score = "\n\n".join(lines) if lines else None
+                        except Exception:
+                            pass
+                        if not shown_score and score_txt:
+                            shown_score = score_txt.splitlines()[0]
+                        if shown_score:
+                            st.markdown(shown_score)
+
                         if snippet:
-                            with st.expander("View retrieved snippet"):
+                            with st.expander("View best retrieved snippet"):
                                 st.code(snippet)
+
+                        others = [it for it in pack["all"] if it is not best_item]
+                        if others:
+                            with st.expander(f"Other retrieved snippets ({len(others)})"):
+                                for j, it in enumerate(others, start=1):
+                                    st.markdown(f"**Snippet {j}**")
+                                    st.code((it.get("cv_snippet") or "").strip())
+
+                    # Chat history block (compact)
+                    pretty = name if name != "Unknown Candidate" else f"Candidate {idx}"
+                    score_line = ""
+                    try:
+                        obj = json.loads(score_txt)
+                        if isinstance(obj, dict) and "score" in obj:
+                            score_line = f"Score: {obj['score']}/100"
+                    except Exception:
+                        if score_txt:
+                            score_line = score_txt.splitlines()[0]
+                    block = [f"**{pretty}**"]
+                    if score_line:
+                        block.append(score_line)
+                    if snippet:
+                        block += ["```", snippet, "```"]
+                    combined_lines.append("\n\n".join(block))
+
                 bot_response = "\n\n---\n\n".join(combined_lines) if combined_lines else "No results."
 
             # Handle old format: list of strings
