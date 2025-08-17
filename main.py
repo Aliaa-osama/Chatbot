@@ -48,12 +48,14 @@ vectorstore = Chroma.from_documents(documents=chunk, embedding=embeddings, colle
 
 # ===== PROMPTS =====
 score_prompt = ChatPromptTemplate.from_template(
-    """You are a resume scoring assistant.
+  """You are a resume scoring assistant.
 You will be given a job description and one or more CV snippets (may include multiple candidates).
 Score how well the CV content matches the job description.
+
 Return:
 - A score from 0 to 100 (higher is better)
-- A brief explanation focusing on concrete matches and gaps.
+- A brief explanation focusing on concrete matches and gaps
+- The candidate’s name (ensure names are unique in the output; do not repeat the same name if it appears in multiple snippets)."
 
 Job Description:
 {job_description}
