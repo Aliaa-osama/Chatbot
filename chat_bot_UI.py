@@ -196,7 +196,35 @@ if prompt:
                             with st.expander("View best retrieved snippet"):
                                 st.code(snippet)
 
-                        others = [it for it in pack["all"] if it is not best_item]
+                        # Build "others" but EXCLUDE same-name snippets
+                        others = []
+                        for it in pack["all"]:
+                            if it is best_item:
+                                continue
+                            # extract other_name (same method)
+                            other_name = None
+                            score_txt_o = (it.get("score") or "").strip()
+                            snippet_txt_o = (it.get("cv_snippet") or "")
+                            try:
+                                obj_o = json.loads(score_txt_o)
+                                if isinstance(obj_o, dict):
+                                    other_name = obj_o.get("name") or obj_o.get("file") or obj_o.get("filename")
+                            except Exception:
+                                pass
+                            if not other_name:
+                                for line in snippet_txt_o.splitlines():
+                                    if line.strip().lower().startswith("cv:"):
+                                        other_name = line.split(":", 1)[-1].strip()
+                                        break
+                            if other_name:
+                                other_name = other_name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+                                other_name = re.sub(r"\.(pdf|docx?)$", "", other_name, flags=re.I).replace("_", " ").strip()
+                            if not other_name:
+                                other_name = "Unknown Candidate"
+
+                            if other_name != name:
+                                others.append(it)
+
                         if others:
                             with st.expander(f"Other retrieved snippets ({len(others)})"):
                                 for j, it in enumerate(others, start=1):
