@@ -27,7 +27,7 @@ app = FastAPI(title="Chatbot + Resume Scorer API (Chroma, PDF via PyPDFLoader)",
 
 # ===== MODELS =====
 
-scoring_llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, google_api_key=GOOGLE_API_KEY)
+scoring_llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, google_api_key=GOOGLE_API_KEY)  
 
 # ===== LOADERS =====
 load = PyPDFDirectoryLoader(str(DEFAULT_CV_DIR))
@@ -70,8 +70,8 @@ def relevant_docs(query: str, k: int = 2):
     if vectorstore is None:
         return []
     pairs = vectorstore.similarity_search_with_score(query, k=k)
-    # distance asc => most similar first
-    pairs.sort(key=lambda x: x[1], reverse=True)
+    
+    pairs.sort(key=lambda x: x[1], reverse=False)
     formatted = []
     for doc, dist in pairs:
         formatted.append(
