@@ -98,14 +98,25 @@ class AskRequest(BaseModel):
 class ReindexRequest(BaseModel):
     directory: Optional[str] = None
 
-@app.post("/ask", response_model=List[str])
+@app.post("/ask")
 async def ask(request: AskRequest):
     """
-    Retrieve relevant CVs based on a query.
+    Retrieve relevant CVs and score them.
     """
     if request.query is None or request.query.strip() == "":
         return []
-    return relevant_docs(request.query, k=request.k)
+
+    docs = relevant_docs(request.query, k=request.k)
+
+    results = []
+    for d in docs:
+        scored = score_cv(request.query, d)
+        results.append({
+            "cv_snippet": d,
+            "score": scored
+        })
+
+    return results
 
 
 
