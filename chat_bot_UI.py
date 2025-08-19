@@ -6,12 +6,12 @@ import re
 
 # ================== Config ==================
 st.set_page_config(page_title="CV RAG Chat", layout="centered")
-st.title("CV RAG Chat — Aliaa Osama Alkady")
+st.title("AI Assistant — Chat & Candidate Ranking")
 
 # Where your FastAPI is running (no trailing slash)
 API_BASE = "https://chatbot-43d0.onrender.com"
 
-# ================== Sidebar ==================
+# ================== Sidebar (uploads only) ==================
 k = st.sidebar.slider("Top Candidates (k)", 1, 10, 2)
 st.sidebar.divider()
 st.sidebar.subheader("Upload CV(s)")
@@ -56,38 +56,6 @@ if st.sidebar.button("Upload batch"):
             st.sidebar.error(f"Batch error: {e}")
 
 st.sidebar.divider()
-st.sidebar.subheader("Index maintenance")
-col_a, col_b = st.sidebar.columns(2)
-if col_a.button("Reset index"):
-    try:
-        r = requests.post(f"{API_BASE}/reset", timeout=60)
-        if r.ok:
-            st.sidebar.success("Index reset to empty ✅")
-            st.sidebar.code(json.dumps(r.json(), ensure_ascii=False, indent=2))
-        else:
-            st.sidebar.error(f"Reset failed: {r.status_code}")
-            st.sidebar.code(r.text)
-    except requests.RequestException as e:
-        st.sidebar.error(f"Reset error: {e}")
-
-reindex_dir = st.sidebar.text_input("Reindex directory (optional)", value="")
-drop_first = st.sidebar.checkbox("Drop before reindex", value=True)
-if col_b.button("Reindex"):
-    try:
-        body = {"directory": reindex_dir or None, "drop_first": bool(drop_first)}
-        r = requests.post(f"{API_BASE}/reindex", json=body, timeout=600)
-        if r.ok:
-            st.sidebar.success("Reindexed ✅")
-            st.sidebar.code(json.dumps(r.json(), ensure_ascii=False, indent=2))
-        else:
-            st.sidebar.error(f"Reindex failed: {r.status_code}")
-            st.sidebar.code(r.text)
-    except requests.RequestException as e:
-        st.sidebar.error(f"Reindex error: {e}")
-
-st.sidebar.divider()
-debug_mode = st.sidebar.checkbox("Show raw API response (debug)", value=False)
-
 if st.sidebar.button("Clear chat"):
     st.session_state.pop("messages", None)
     st.rerun()
@@ -183,10 +151,6 @@ if prompt:
         with st.spinner("Thinking..."):
             data = post_json(endpoint, payload)
 
-            if debug_mode:
-                st.caption("Raw API response:")
-                st.code(json.dumps(data, ensure_ascii=False, indent=2))
-
             # ================= JD mode: list of {cv_snippet, score} =================
             if isinstance(data, list) and data and isinstance(data[0], dict):
                 buckets = {}  # name -> {"item": best_item, "score_val": float|None, "reason": str|None, "all": [items]}
@@ -265,27 +229,14 @@ if prompt:
 
                 bot_response = "\n\n---\n\n".join(combined_lines) if combined_lines else "No results."
 
-            # ============== General mode: {"mode":"general","rewritten":..., "answer":...} ==============
+            # ============== General mode: hide rewritten query, show only answer ==============
             elif isinstance(data, dict) and data.get("mode") == "general":
-                rewritten = (data.get("rewritten") or "").strip()
                 answer = (data.get("answer") or "").strip()
-
-                if rewritten:
-                    st.caption("Rewritten query")
-                    st.markdown(f"> {rewritten}")
-
                 if answer:
                     st.markdown(answer)
                 else:
                     st.info("No answer returned.")
-
-                # Save a compact transcript block
-                block = []
-                if rewritten:
-                    block.append(f"_Rewritten_: {rewritten}")
-                if answer:
-                    block.append(answer)
-                bot_response = "\n\n".join(block) if block else "No response."
+                bot_response = answer or "No response."
 
             # Old format: list of strings
             elif isinstance(data, list) and all(isinstance(x, str) for x in data):
