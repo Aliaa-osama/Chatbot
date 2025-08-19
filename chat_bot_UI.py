@@ -13,7 +13,6 @@ API_BASE = "https://chatbot-43d0.onrender.com"
 
 # ================== Sidebar ==================
 k = st.sidebar.slider("Top Candidates (k)", 1, 10, 2)
-
 st.sidebar.divider()
 st.sidebar.subheader("Upload CV(s)")
 
@@ -57,6 +56,38 @@ if st.sidebar.button("Upload batch"):
             st.sidebar.error(f"Batch error: {e}")
 
 st.sidebar.divider()
+st.sidebar.subheader("Index maintenance")
+col_a, col_b = st.sidebar.columns(2)
+if col_a.button("Reset index"):
+    try:
+        r = requests.post(f"{API_BASE}/reset", timeout=60)
+        if r.ok:
+            st.sidebar.success("Index reset to empty ✅")
+            st.sidebar.code(json.dumps(r.json(), ensure_ascii=False, indent=2))
+        else:
+            st.sidebar.error(f"Reset failed: {r.status_code}")
+            st.sidebar.code(r.text)
+    except requests.RequestException as e:
+        st.sidebar.error(f"Reset error: {e}")
+
+reindex_dir = st.sidebar.text_input("Reindex directory (optional)", value="")
+drop_first = st.sidebar.checkbox("Drop before reindex", value=True)
+if col_b.button("Reindex"):
+    try:
+        body = {"directory": reindex_dir or None, "drop_first": bool(drop_first)}
+        r = requests.post(f"{API_BASE}/reindex", json=body, timeout=600)
+        if r.ok:
+            st.sidebar.success("Reindexed ✅")
+            st.sidebar.code(json.dumps(r.json(), ensure_ascii=False, indent=2))
+        else:
+            st.sidebar.error(f"Reindex failed: {r.status_code}")
+            st.sidebar.code(r.text)
+    except requests.RequestException as e:
+        st.sidebar.error(f"Reindex error: {e}")
+
+st.sidebar.divider()
+debug_mode = st.sidebar.checkbox("Show raw API response (debug)", value=False)
+
 if st.sidebar.button("Clear chat"):
     st.session_state.pop("messages", None)
     st.rerun()
@@ -136,7 +167,7 @@ for msg in st.session_state.messages:
         st.markdown(msg["content"])
 
 # ================== Chat input ==================
-prompt = st.chat_input("Type your job description.")
+prompt = st.chat_input("Type your job description or ask a general question.")
 if prompt:
     # 1) show user message
     st.session_state.messages.append({"role": "user", "content": prompt})
@@ -152,15 +183,12 @@ if prompt:
         with st.spinner("Thinking..."):
             data = post_json(endpoint, payload)
 
-            # For debugging, uncomment:
-            # st.write("RAW:", data)
+            if debug_mode:
+                st.caption("Raw API response:")
+                st.code(json.dumps(data, ensure_ascii=False, indent=2))
 
-            if isinstance(data, dict) and "error" in data:
-                bot_response = data["error"]
-                st.error(bot_response)
-
-            elif isinstance(data, list) and data and isinstance(data[0], dict):
-                # ---- DEDUPE: group by name, keep highest score, then limit to k ----
+            # ================= JD mode: list of {cv_snippet, score} =================
+            if isinstance(data, list) and data and isinstance(data[0], dict):
                 buckets = {}  # name -> {"item": best_item, "score_val": float|None, "reason": str|None, "all": [items]}
                 for item in data:
                     score_txt = (item.get("score") or "").strip()
@@ -177,13 +205,11 @@ if prompt:
                         if (score_val is not None) and (cur is None or score_val > cur):
                             entry["item"], entry["score_val"], entry["reason"] = item, score_val, reason_val
 
-                # sort by score desc (None last), then by name; apply top-k AFTER dedupe
                 unique = sorted(
                     buckets.items(),
                     key=lambda kv: (-(kv[1]["score_val"] if kv[1]["score_val"] is not None else float("-inf")), kv[0].lower()),
                 )[: int(k)]
 
-                # ---------- Render + build transcript ----------
                 combined_lines = []
                 for idx, (name, pack) in enumerate(unique, start=1):
                     best_item = pack["item"]
@@ -199,7 +225,6 @@ if prompt:
                             st.markdown(f"**Score:** {int(parsed_score) if parsed_score.is_integer() else parsed_score}/100")
                         if parsed_reason:
                             st.markdown(f"**Reason:** {parsed_reason}")
-
                         if parsed_score is None and parsed_reason is None and score_txt:
                             st.markdown(score_txt.splitlines()[0])
 
@@ -240,13 +265,38 @@ if prompt:
 
                 bot_response = "\n\n---\n\n".join(combined_lines) if combined_lines else "No results."
 
+            # ============== General mode: {"mode":"general","rewritten":..., "answer":...} ==============
+            elif isinstance(data, dict) and data.get("mode") == "general":
+                rewritten = (data.get("rewritten") or "").strip()
+                answer = (data.get("answer") or "").strip()
+
+                if rewritten:
+                    st.caption("Rewritten query")
+                    st.markdown(f"> {rewritten}")
+
+                if answer:
+                    st.markdown(answer)
+                else:
+                    st.info("No answer returned.")
+
+                # Save a compact transcript block
+                block = []
+                if rewritten:
+                    block.append(f"_Rewritten_: {rewritten}")
+                if answer:
+                    block.append(answer)
+                bot_response = "\n\n".join(block) if block else "No response."
+
+            # Old format: list of strings
             elif isinstance(data, list) and all(isinstance(x, str) for x in data):
-                # old format: list of strings
                 bot_response = "\n\n---\n\n".join(data) if data else "No results."
                 st.markdown(f"```\n{bot_response}\n```")
 
+            # Error or unknown shape
+            elif isinstance(data, dict) and "error" in data:
+                bot_response = data["error"]
+                st.error(bot_response)
             else:
-                # fallback: show raw JSON
                 bot_response = json.dumps(data, ensure_ascii=False, indent=2)
                 st.code(bot_response)
 

@@ -1,10 +1,11 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from dotenv import load_dotenv
 import os
 from pathlib import Path
 import uvicorn
+import re
 
 # LangChain / Google GenAI / Chroma
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
@@ -22,31 +23,32 @@ COLLECTION_NAME = os.getenv("CHROMA_COLLECTION", "resumes")
 # Default folder for storing PDFs on disk
 DEFAULT_CV_DIR = Path(__file__).resolve().parent / "cvs"
 
-
 app = FastAPI(title="Chatbot + Resume Scorer API (Chroma, PDF via PyPDFLoader)", version="1.0.0")
 
 # ===== MODELS =====
+chat_llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.2, google_api_key=GOOGLE_API_KEY)
+scoring_llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, google_api_key=GOOGLE_API_KEY)
 
-scoring_llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, google_api_key=GOOGLE_API_KEY)  
-
-# ===== LOADERS =====
-load = PyPDFDirectoryLoader(str(DEFAULT_CV_DIR))
-doc = load.load()
+# ===== LOAD SEED DOCS (optional) =====
+DEFAULT_CV_DIR.mkdir(parents=True, exist_ok=True)
+seed_docs = PyPDFDirectoryLoader(str(DEFAULT_CV_DIR)).load() if any(DEFAULT_CV_DIR.iterdir()) else []
 
 # ===== TEXT SPLITTER =====
 text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-chunk = text_splitter.split_documents(doc)
-for doc in chunk:
-    src = doc.metadata.get("source", "Unknown CV")
-    doc.metadata["file_name"] = Path(src).name
+seed_chunks = text_splitter.split_documents(seed_docs)
+for d in seed_chunks:
+    src = d.metadata.get("source", "Unknown CV")
+    d.metadata["file_name"] = Path(src).name
 
 # ===== EMBEDDINGS =====
 embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=GOOGLE_API_KEY)
 
-# ===== VECTORSTORE =====
-vectorstore = Chroma.from_documents(documents=chunk, embedding=embeddings, collection_name=COLLECTION_NAME)
+# ===== VECTORSTORE (start with current files, if any) =====
+vectorstore = Chroma.from_documents(documents=seed_chunks, embedding=embeddings, collection_name=COLLECTION_NAME) \
+    if seed_chunks else Chroma(collection_name=COLLECTION_NAME, embedding_function=embeddings)
 
-# ===== PROMPTS =====
+# ================= PROMPTS =================
+# 1) Scoring prompt (RAG when a job description is provided)
 score_prompt = ChatPromptTemplate.from_template(
     """You are a resume scoring assistant.
 You will be given a job description and one or more CV snippets (may include multiple candidates).
@@ -61,17 +63,58 @@ Job Description:
 CV Content:
 {cv}
 
-Return a concise response: "Score: <number>/100
+Return a concise response:
+"Score: <number>/100
 Reason: <one short paragraph>"."""
 )
 
-def relevant_docs(query: str, k: int = 2):
-    """Retrieve top-k relevant documents with scores and format them."""
+# 2) Query rewrite prompt (always used first)
+rewrite_prompt = ChatPromptTemplate.from_template(
+    """Rewrite the user's message to be short, clear, and unambiguous.
+Keep all important details, remove filler, and output ONLY the rewritten text with no quotes.
+
+Original:
+{q}"""
+)
+
+# 3) General knowledge answer prompt (when it's NOT a job description)
+general_answer_prompt = ChatPromptTemplate.from_template(
+    """You are a helpful assistant. Answer concisely and accurately from your general knowledge.
+
+Rewritten question:
+{rewritten}
+
+Original question (for context):
+{original}"""
+)
+
+# ================== HELPERS ==================
+def rewrite_query(q: str) -> str:
+    try:
+        return chat_llm.invoke(rewrite_prompt.format_messages(q=q)).content.strip()
+    except Exception:
+        return q.strip()
+
+def looks_like_job_description(text: str) -> bool:
+    """
+    Lightweight heuristic: if it contains typical JD markers or is long enough.
+    You can replace this with an LLM-based classifier if you like.
+    """
+    t = text.lower()
+    markers = [
+        "job description", "responsibilit", "requirement", "qualifications",
+        "we are looking", "years of experience", "skills", "preferred", "nice to have",
+        "role:", "duties", "must have", "stack", "tech stack", "position:", "about the role"
+    ]
+    hits = sum(m in t for m in markers)
+    return hits >= 2 or len(t.split()) >= 40  # tweak as you prefer
+
+def relevant_docs(query: str, k: int = 2) -> List[str]:
+    """Retrieve top-k relevant documents with distances and format them."""
     if vectorstore is None:
         return []
     pairs = vectorstore.similarity_search_with_score(query, k=k)
-    
-    pairs.sort(key=lambda x: x[1], reverse=False)
+    pairs.sort(key=lambda x: x[1])  # ascending distance
     formatted = []
     for doc, dist in pairs:
         formatted.append(
@@ -81,46 +124,90 @@ def relevant_docs(query: str, k: int = 2):
         )
     return formatted
 
-# === SCORE CV =====
-def score_cv(job_description: str, cv_content: str):
+def score_cv(job_description: str, cv_content: str) -> str:
     """Use the scoring prompt & LLM to output a score and reason."""
     messages = score_prompt.format_messages(job_description=job_description, cv=cv_content)
     response = scoring_llm.invoke(messages)
     return response.content
 
-# ===== API ENDPOINTS =====
+# ---------- Vector store maintenance ----------
+def _wipe_collection_all_docs(vs: Chroma) -> int:
+    """
+    Delete ALL documents from the existing Chroma collection.
+    Returns how many ids were deleted.
+    """
+    try:
+        col = vs._collection
+        deleted = 0
+        offset = 0
+        batch = 1000
+        while True:
+            # get only ids for efficiency
+            res = col.get(include=[], limit=batch, offset=offset)
+            ids = res.get("ids", [])
+            if not ids:
+                break
+            col.delete(ids=ids)
+            deleted += len(ids)
+            # do not increase offset after delete; items shift; continue fetching from 0
+        return deleted
+    except Exception:
+        # Fallback: drop and recreate the collection entirely
+        try:
+            vs._client.delete_collection(COLLECTION_NAME)
+        except Exception:
+            pass
+        return -1  # unknown count
+
+def _recreate_empty_vectorstore() -> Chroma:
+    """Create a fresh empty collection with the same name."""
+    return Chroma(collection_name=COLLECTION_NAME, embedding_function=embeddings)
+
+# ================== API MODELS ==================
 class AskRequest(BaseModel):
     query: str
     k: int = 2
 
-
-
 class ReindexRequest(BaseModel):
     directory: Optional[str] = None
+    drop_first: bool = False  # NEW: if true, clear collection before reindex
 
+# ================== ENDPOINTS ==================
 @app.post("/ask")
 async def ask(request: AskRequest):
     """
-    Retrieve relevant CVs and score them.
+    Auto-mode:
+      - Rewrite the user's query.
+      - If it looks like a job description: retrieve top-k CVs and score them.
+      - Else: answer from LLM's general knowledge.
+
+    Returns:
+      - JD mode: list of {cv_snippet, score}  (backward-compatible with your UI)
+      - General mode: {"mode":"general","rewritten":..., "answer": ...}
     """
-    if request.query is None or request.query.strip() == "":
+    raw_q = (request.query or "").strip()
+    if not raw_q:
         return []
 
-    docs = relevant_docs(request.query, k=request.k)
+    rewritten = rewrite_query(raw_q)
 
-    results = []
-    for d in docs:
-        scored = score_cv(request.query, d)
-        results.append({
-            "cv_snippet": d,
-            "score": scored
-        })
+    # JD mode (retrieve + score)
+    if looks_like_job_description(rewritten):
+        docs = relevant_docs(rewritten, k=request.k)
+        results = []
+        for d in docs:
+            scored = score_cv(rewritten, d)
+            results.append({"cv_snippet": d, "score": scored})
+        # Your Streamlit already handles list-of-dicts
+        return results
 
-    return results
+    # General knowledge mode
+    answer = chat_llm.invoke(
+        general_answer_prompt.format_messages(rewritten=rewritten, original=raw_q)
+    ).content
+    return {"mode": "general", "rewritten": rewritten, "answer": answer}
 
-
-
-# ===== REINDEX =====
+# ----- REINDEX (rebuild from folder) -----
 def rebuild_vectorstore(pdf_dir: str) -> Chroma:
     loader = PyPDFDirectoryLoader(pdf_dir)
     docs = loader.load()
@@ -143,14 +230,20 @@ def rebuild_vectorstore(pdf_dir: str) -> Chroma:
 async def reindex(req: ReindexRequest):
     """
     Rebuild the vector store from a directory of PDFs.
-    Example body: { "directory": "E:/NTI/chatbot/cvs" }
+    Example body:
+      { "directory": "E:/NTI/chatbot/cvs", "drop_first": true }
     If 'directory' is omitted, the default path is used.
+    If 'drop_first' is true, the collection is cleared before reindexing.
     """
     target_dir = Path(req.directory or DEFAULT_CV_DIR)
     if not target_dir.exists() or not target_dir.is_dir():
         raise HTTPException(status_code=400, detail=f"Directory not found: {target_dir}")
 
     global vectorstore
+    if req.drop_first and vectorstore is not None:
+        _wipe_collection_all_docs(vectorstore)
+        vectorstore = _recreate_empty_vectorstore()
+
     vectorstore = rebuild_vectorstore(str(target_dir))
 
     try:
@@ -160,8 +253,27 @@ async def reindex(req: ReindexRequest):
 
     return {"status": "reindexed", "directory": str(target_dir), "num_docs": count}
 
-# ======== UPLOAD HELPERS & ENDPOINTS ========
+# ----- RESET / DROP to EMPTY (no docs) -----
+@app.post("/reset")
+async def reset_index():
+    """
+    Drops ALL vectors from the current collection and recreates an empty collection.
+    Use this to make the index empty.
+    """
+    global vectorstore
+    if vectorstore is None:
+        vectorstore = _recreate_empty_vectorstore()
+        return {"status": "reset", "vector_count": 0}
 
+    deleted = _wipe_collection_all_docs(vectorstore)
+    vectorstore = _recreate_empty_vectorstore()
+    try:
+        count = vectorstore._collection.count()
+    except Exception:
+        count = 0
+    return {"status": "reset", "deleted": deleted, "vector_count": count}
+
+# ======== UPLOAD HELPERS & ENDPOINTS ========
 def _unique_path(path: Path) -> Path:
     """Avoid overwriting files: adds _1, _2, ... if name exists."""
     if not path.exists():
@@ -184,17 +296,13 @@ def _index_pdf_file(pdf_path: Path):
     # Add to existing index
     global vectorstore
     if vectorstore is None:
-        # Shouldn't happen in your flow, but safe fallback:
-        vs = Chroma.from_documents(documents=chunks, embedding=embeddings, collection_name=COLLECTION_NAME)
-        vectorstore = vs
+        vectorstore = Chroma.from_documents(documents=chunks, embedding=embeddings, collection_name=COLLECTION_NAME)
     else:
         vectorstore.add_documents(chunks)
 
 @app.post("/upload")
 async def upload_cv(file: UploadFile = File(...)):
-    """
-    Upload a single CV PDF and add it to the vectorstore.
-    """
+    """Upload a single CV PDF and add it to the vectorstore."""
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
     DEFAULT_CV_DIR.mkdir(parents=True, exist_ok=True)
@@ -209,21 +317,13 @@ async def upload_cv(file: UploadFile = File(...)):
         _index_pdf_file(dest)
         count = vectorstore._collection.count()
     except Exception as e:
-        # Clean up file on failure (optional)
-        # dest.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=f"Indexing failed: {str(e)}")
 
-    return {
-        "status": "uploaded",
-        "saved_as": str(dest),
-        "vector_count": count
-    }
+    return {"status": "uploaded", "saved_as": str(dest), "vector_count": count}
 
 @app.post("/upload-batch")
 async def upload_cv_batch(files: List[UploadFile] = File(...)):
-    """
-    Upload multiple CV PDFs and add them to the vectorstore.
-    """
+    """Upload multiple CV PDFs and add them to the vectorstore."""
     if not files:
         raise HTTPException(status_code=400, detail="No files provided.")
     DEFAULT_CV_DIR.mkdir(parents=True, exist_ok=True)
@@ -238,8 +338,7 @@ async def upload_cv_batch(files: List[UploadFile] = File(...)):
         try:
             _index_pdf_file(dest)
             saved.append(str(dest))
-        except Exception as e:
-            # skip problematic file but continue others
+        except Exception:
             continue
 
     try:
@@ -251,17 +350,15 @@ async def upload_cv_batch(files: List[UploadFile] = File(...)):
         raise HTTPException(status_code=400, detail="No valid PDFs were uploaded or indexed.")
     return {"status": "uploaded", "saved": saved, "vector_count": count}
 
-# ===== HEALTH CHECK =====
+# ===== HEALTH CHECK / ROOT =====
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
-# ===== DOCS =====
 @app.get("/", include_in_schema=False)
 async def root():
     return {"message": "Welcome to the Chatbot + Resume Scorer API! Use /docs for API documentation."}
 
 # ===== LOCAL RUN =====
 if __name__ == "__main__":
-   
     uvicorn.run(app, host="127.0.0.1", port=8000)
