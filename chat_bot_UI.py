@@ -31,7 +31,7 @@ if st.sidebar.button("Upload"):
             )
             if res.ok:
                 st.sidebar.success("Uploaded & indexed ✅")
-                st.sidebar.code(json.dumps(res.json(), ensure_ascii=False, indent=2))
+                #st.sidebar.code(json.dumps(res.json(), ensure_ascii=False, indent=2))
             else:
                 st.sidebar.error(f"Upload failed: {res.status_code}")
                 st.sidebar.code(res.text)
@@ -51,7 +51,7 @@ if st.sidebar.button("Upload batch"):
             res = requests.post(f"{API_BASE}/upload-batch", files=payload, timeout=600)
             if res.ok:
                 st.sidebar.success("Batch uploaded & indexed ✅")
-                st.sidebar.code(json.dumps(res.json(), ensure_ascii=False, indent=2))
+                #st.sidebar.code(json.dumps(res.json(), ensure_ascii=False, indent=2))
             else:
                 st.sidebar.error(f"Batch failed: {res.status_code}")
                 st.sidebar.code(res.text)
@@ -72,12 +72,71 @@ if "messages" not in st.session_state:
 def post_json(path, payload, timeout=180):
     r = requests.post(f"{API_BASE}{path}", json=payload, timeout=timeout)
     if not r.ok:
-        # Return a dict error so downstream rendering is consistent
         return {"error": f"Error {r.status_code}: {r.text}"}
     try:
         return r.json()
     except Exception:
         return {"error": "Non-JSON response from server.", "raw": r.text}
+
+# ---------- NEW: helpers to extract name, score, reason ----------
+def extract_display_name(score_txt: str, snippet_txt: str) -> str:  # NEW
+    name = None
+    # Try JSON: {"name": ..., "file": ..., "filename": ...}
+    try:
+        obj = json.loads(score_txt or "")
+        if isinstance(obj, dict):
+            name = obj.get("name") or obj.get("file") or obj.get("filename")
+    except Exception:
+        pass
+
+    # Fallback to "CV: ..." line inside snippet
+    if not name:
+        for line in (snippet_txt or "").splitlines():
+            if line.strip().lower().startswith("cv:"):
+                name = line.split(":", 1)[-1].strip()
+                break
+
+    # Normalize for display
+    if name:
+        name = name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        name = re.sub(r"\.(pdf|docx?)$", "", name, flags=re.I)
+        name = re.sub(r"[_\s]+", " ", name).strip()
+    return name or "Unknown Candidate"
+
+def parse_score_and_reason(score_txt: str):  # NEW
+    """
+    Supports either:
+      - Plain text: 'Score: 83/100\\nReason: ...'
+      - JSON: {"score": 83, "explanation": "..."} (or "reason")
+    Returns (score_val: float|None, reason: str|None)
+    """
+    score_val, reason = None, None
+
+    # JSON path
+    try:
+        obj = json.loads(score_txt or "")
+        if isinstance(obj, dict):
+            if "score" in obj and obj["score"] is not None:
+                score_val = float(obj["score"])
+            reason = obj.get("explanation") or obj.get("reason")
+    except Exception:
+        pass
+
+    # Plain-text fallbacks
+    if score_val is None:
+        m = re.search(r"Score\s*:\s*(\d+(?:\.\d+)?)(?:\s*/\s*100)?", score_txt or "", flags=re.I)
+        if m:
+            try:
+                score_val = float(m.group(1))
+            except Exception:
+                pass
+
+    if not reason:
+        m2 = re.search(r"Reason\s*:\s*(.+)", score_txt or "", flags=re.I | re.S)
+        if m2:
+            reason = m2.group(1).strip()
+
+    return score_val, reason
 
 # ---------- Render history ----------
 for msg in st.session_state.messages:
@@ -108,55 +167,24 @@ if prompt:
 
             # Handle new format: list of dicts {cv_snippet, score}
             elif isinstance(data, list) and data and isinstance(data[0], dict):
-                # ---- DEDUPE INLINE: group by name, keep highest score, then limit to k ----
-                buckets = {}  # name -> {"item": best_item, "score_val": float|None, "all": [items]}
+                # ---- DEDUPE: group by name, keep highest score, then limit to k ----
+                # UPDATED: store parsed reason too
+                buckets = {}  # name -> {"item": best_item, "score_val": float|None, "reason": str|None, "all": [items]}
                 for item in data:
                     score_txt = (item.get("score") or "").strip()
                     snippet_txt = (item.get("cv_snippet") or "")
 
-                    # derive display name (try JSON->name/file/filename, else "CV: ..." line)
-                    name = None
-                    try:
-                        obj = json.loads(score_txt)
-                        if isinstance(obj, dict):
-                            name = obj.get("name") or obj.get("file") or obj.get("filename")
-                    except Exception:
-                        pass
-                    if not name:
-                        for line in snippet_txt.splitlines():
-                            if line.strip().lower().startswith("cv:"):
-                                name = line.split(":", 1)[-1].strip()
-                                break
-                    if name:
-                        name = name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-                        name = re.sub(r"\.(pdf|docx?)$", "", name, flags=re.I).replace("_", " ").strip()
-                    if not name:
-                        name = "Unknown Candidate"
-
-                    # numeric score (JSON 'score' or "Score: 78[/100]")
-                    score_val = None
-                    try:
-                        obj = json.loads(score_txt)
-                        if isinstance(obj, dict) and "score" in obj:
-                            score_val = float(obj["score"])
-                    except Exception:
-                        pass
-                    if score_val is None:
-                        m = re.search(r"Score\s*:\s*(\d+(?:\.\d+)?)(?:\s*/\s*100)?", score_txt, flags=re.I)
-                        if m:
-                            try:
-                                score_val = float(m.group(1))
-                            except Exception:
-                                pass
+                    name = extract_display_name(score_txt, snippet_txt)  # UPDATED
+                    score_val, reason_val = parse_score_and_reason(score_txt)  # UPDATED
 
                     entry = buckets.get(name)
                     if not entry:
-                        buckets[name] = {"item": item, "score_val": score_val, "all": [item]}
+                        buckets[name] = {"item": item, "score_val": score_val, "reason": reason_val, "all": [item]}
                     else:
                         entry["all"].append(item)
                         cur = entry["score_val"]
                         if (score_val is not None) and (cur is None or score_val > cur):
-                            entry["item"], entry["score_val"] = item, score_val
+                            entry["item"], entry["score_val"], entry["reason"] = item, score_val, reason_val
 
                 # sort by score desc (None last), then name; apply k AFTER dedupe
                 unique = sorted(
@@ -164,101 +192,4 @@ if prompt:
                     key=lambda kv: (-(kv[1]["score_val"] if kv[1]["score_val"] is not None else float("-inf")), kv[0].lower()),
                 )[: int(k)]
 
-                # Render + build transcript
-                combined_lines = []
-                for idx, (name, pack) in enumerate(unique, start=1):
-                    best_item = pack["item"]
-                    score_txt = (best_item.get("score") or "").strip()
-                    snippet = (best_item.get("cv_snippet") or "").strip()
-
-                    with st.container(border=True):
-                        st.markdown(f"### {name if name != 'Unknown Candidate' else f'Candidate {idx}'}")
-
-                        # Friendly score summary if possible
-                        shown_score = None
-                        try:
-                            obj = json.loads(score_txt)
-                            if isinstance(obj, dict):
-                                lines = []
-                                if "score" in obj:
-                                    lines.append(f"**Score:** {obj['score']}/100")
-                                if "explanation" in obj and obj["explanation"]:
-                                    lines.append(f"**Reason:** {obj['explanation']}")
-                                shown_score = "\n\n".join(lines) if lines else None
-                        except Exception:
-                            pass
-                        if not shown_score and score_txt:
-                            shown_score = score_txt.splitlines()[0]
-                        if shown_score:
-                            st.markdown(shown_score)
-
-                        if snippet:
-                            with st.expander("View best retrieved snippet"):
-                                st.code(snippet)
-
-                        # Build "others" but EXCLUDE same-name snippets
-                        others = []
-                        for it in pack["all"]:
-                            if it is best_item:
-                                continue
-                            # extract other_name (same method)
-                            other_name = None
-                            score_txt_o = (it.get("score") or "").strip()
-                            snippet_txt_o = (it.get("cv_snippet") or "")
-                            try:
-                                obj_o = json.loads(score_txt_o)
-                                if isinstance(obj_o, dict):
-                                    other_name = obj_o.get("name") or obj_o.get("file") or obj_o.get("filename")
-                            except Exception:
-                                pass
-                            if not other_name:
-                                for line in snippet_txt_o.splitlines():
-                                    if line.strip().lower().startswith("cv:"):
-                                        other_name = line.split(":", 1)[-1].strip()
-                                        break
-                            if other_name:
-                                other_name = other_name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-                                other_name = re.sub(r"\.(pdf|docx?)$", "", other_name, flags=re.I).replace("_", " ").strip()
-                            if not other_name:
-                                other_name = "Unknown Candidate"
-
-                            if other_name != name:
-                                others.append(it)
-
-                        if others:
-                            with st.expander(f"Other retrieved snippets ({len(others)})"):
-                                for j, it in enumerate(others, start=1):
-                                    st.markdown(f"**Snippet {j}**")
-                                    st.code((it.get("cv_snippet") or "").strip())
-
-                    # Chat history block (compact)
-                    pretty = name if name != "Unknown Candidate" else f"Candidate {idx}"
-                    score_line = ""
-                    try:
-                        obj = json.loads(score_txt)
-                        if isinstance(obj, dict) and "score" in obj:
-                            score_line = f"Score: {obj['score']}/100"
-                    except Exception:
-                        if score_txt:
-                            score_line = score_txt.splitlines()[0]
-                    block = [f"**{pretty}**"]
-                    if score_line:
-                        block.append(score_line)
-                    if snippet:
-                        block += ["```", snippet, "```"]
-                    combined_lines.append("\n\n".join(block))
-
-                bot_response = "\n\n---\n\n".join(combined_lines) if combined_lines else "No results."
-
-            # Handle old format: list of strings
-            elif isinstance(data, list) and all(isinstance(x, str) for x in data):
-                bot_response = "\n\n---\n\n".join(data) if data else "No results."
-                st.markdown(f"```\n{bot_response}\n```")
-
-            else:
-                # Fallback: show raw JSON
-                bot_response = json.dumps(data, ensure_ascii=False, indent=2)
-                st.code(bot_response)
-
-    # 4) store assistant message
-    st.session_state.messages.append({"role": "assistant", "content": bot_response})
+                # Render + build transcr
