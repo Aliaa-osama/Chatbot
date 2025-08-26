@@ -6,7 +6,7 @@ import re
 
 # ================== Config ==================
 st.set_page_config(page_title="CV RAG Chat", layout="centered")
-st.title("AI Assistant — Chat & Candidate Ranking")
+st.title("ResuMatch")
 
 API_BASE = "https://chatbot-43d0.onrender.com"
 
